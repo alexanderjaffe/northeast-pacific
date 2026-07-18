@@ -1,0 +1,155 @@
+from Bio import SeqIO
+import pandas as pd
+
+samples = []
+for line in open(config["sample_list"]).readlines():
+	samples.append(line.strip())
+
+rule all:
+	input:
+		expand("checkv/{sample}/quality_summary.tsv", sample=samples),
+		expand("mapping/{sample}/{sample}_read_table.tsv", sample=samples),
+		expand("genomad/{sample}_summary/{sample}_virus_summary.tsv", sample=samples)
+
+rule run_vibrant:
+	input:
+		contigs = "/scratch/users/jaslew03/snakemake/assemblies/{sample}.fa"
+	output:
+		fasta = "vibrant/VIBRANT_{sample}/VIBRANT_phages_{sample}/{sample}.phages_combined.fna"
+	shell:
+		"""
+		singularity exec /home/groups/dekas/software/singularity/vibrant_latest.sif VIBRANT_run.py -i {input.contigs} \
+			-folder vibrant/ -t {threads}
+		"""
+
+rule process_vibrant:
+	input:
+		fasta = "vibrant/VIBRANT_{sample}/VIBRANT_phages_{sample}/{sample}.phages_combined.fna"
+	output:
+		renamed_fasta = "sequences/{sample}/{sample}_vibrant.renamed.fna",
+	run:
+		with open(output.renamed_fasta, "w") as out:
+				for record in SeqIO.parse(input.fasta, "fasta"):
+					if len(record.seq) >= 0:
+						out.write(">vibrant_%s\n%s\n" %(record.description, str(record.seq)))
+
+rule run_genomad:
+    input:
+        contigs = "/scratch/users/jaslew03/snakemake/assemblies/{sample}.fa"
+    output:
+        fasta = "genomad/{sample}_summary/{sample}_virus.fna",
+        table = "genomad/{sample}_summary/{sample}_virus_summary.tsv"
+    shell:
+        """
+        genomad end-to-end --threads {threads} {input.contigs} genomad /oak/stanford/groups/dekas/db/genomad_v1.5
+        """
+
+rule process_genomad:
+    input:
+        fasta = "genomad/{sample}_summary/{sample}_virus.fna",
+        table = "genomad/{sample}_summary/{sample}_virus_summary.tsv"
+    output:
+        renamed_fasta = "sequences/{sample}/{sample}_genomad.renamed.fna"
+    run:
+
+        #filter using table?
+        gtable = pd.read_csv(input.table, sep="\t")
+        glist = gtable[(gtable["length"]>=0) &
+               (gtable["virus_score"]>=0)]["seq_name"].to_list()
+
+        #extract contig names from fasta
+        with open(output.renamed_fasta, "w") as out:
+            for record in SeqIO.parse(input.fasta, "fasta"):
+                if record.description in glist:
+                    out.write(">genomad_%s\n%s\n" %(record.description, record.seq))
+
+rule merge_fastas:
+    input:
+        fastas = lambda wildcards: expand("sequences/{sample}/{sample}_{tool}.renamed.fna",
+            sample = wildcards.sample, tool = ["vibrant", "genomad"])
+    output:
+        merged_fasta = "sequences/{sample}/{sample}.merged.fna"
+    run:
+        shell("cat %s > %s" %(" ".join(input.fastas), output.merged_fasta))
+
+rule cluster_merged_fasta:
+    input:
+        merged_fasta = "sequences/{sample}/{sample}.merged.fna"
+    output:
+        cluster_file = "sequences/{sample}/{sample}.clusters.tsv"
+    run:
+        shell("vclust prefilter -i {input.merged_fasta} -o sequences/%s/%s.prefilter.txt --min-kmers 20 --min-ident 0.95 -t {threads}" %(wildcards.sample, wildcards.sample))
+        shell("vclust align -i {input.merged_fasta} -o sequences/%s/%s.ani_align.tsv --filter sequences/%s/%s.prefilter.txt --filter-threshold 0.80" %(wildcards.sample, wildcards.sample, wildcards.sample, wildcards.sample))
+        shell("vclust cluster -i sequences/%s/%s.ani_align.tsv -o {output.cluster_file} --ids sequences/%s/%s.ani_align.ids.tsv --algorithm single --metric ani --ani 0.95" %(wildcards.sample, wildcards.sample, wildcards.sample, wildcards.sample))
+
+rule choose_representatives:
+	input:
+	    cluster_file = "sequences/{sample}/{sample}.clusters.tsv",
+	    merged_fasta = "sequences/{sample}/{sample}.merged.fna"
+	output:
+	    rep_fasta = "sequences/{sample}/{sample}.representative.fna"
+	run:
+
+		cluster_df = pd.read_csv(input.cluster_file, sep="\t")
+
+		sequence_lengths = {}
+
+		for record in SeqIO.parse(input.merged_fasta, "fasta"):
+		    sequence_length = len(record.seq)
+		    sequence_lengths[record.description] = sequence_length
+
+		cluster_df["length"] = cluster_df["object"].map(sequence_lengths)
+		representatives = cluster_df.sort_values("length",
+		    ascending=False).drop_duplicates("cluster")["object"].to_list()
+
+		with open(output.rep_fasta, "w") as out:
+		    for record in SeqIO.parse(input.merged_fasta, "fasta"):
+		        if record.description.split(" ")[0] in representatives:
+		            out.write(">%s\n%s\n" %(record.description, str(record.seq)))
+
+rule run_checkv:
+	input:
+		rep_fasta = "sequences/{sample}/{sample}.representative.fna"
+	output:
+		quality_table = "checkv/{sample}/quality_summary.tsv"
+	threads: 20
+	run:
+		shell("singularity run /home/groups/dekas/software/singularity/checkv_latest.sif end_to_end {input.rep_fasta} -t {threads} checkv/%s/ -d /oak/stanford/groups/dekas/db/checkv-db-v1.5" %(wildcards.sample))
+
+rule build_index:
+	input:
+		assembly = "sequences/{sample}/{sample}.representative.fna"
+	output:
+		idx = "mapping/{sample}/indexed"
+	threads: 20
+	run:
+		ipath = "mapping/%s/%s.idx" %(wildcards.sample, wildcards.sample)
+		btb = "bowtie2-build --threads {threads} {input.assembly} %s" %(ipath)
+		shell(btb)
+		shell("touch {output.idx}")
+
+rule map_reads:
+	input:
+		idx = "mapping/{sample}/indexed",
+		fwd = "reads/{sample}_R1_trimmed.fastq.gz",
+		rev = "reads/{sample}_R2_trimmed.fastq.gz"
+	output:
+		bam = "mapping/{sample}/{sample}.bam",
+		sorted_bam = "mapping/{sample}/{sample}.sorted.bam"
+	threads: 20
+	run:
+		ipath = "mapping/%s/%s.idx" %(wildcards.sample, wildcards.sample)
+		cmd = "bowtie2 -x %s -1 {input.fwd} -2 {input.rev} -p {threads} | shrinksam | samtools view -S -b > {output.bam}" %(ipath)
+		shell(cmd)
+		shell("samtools sort --threads {threads} {output.bam} > {output.sorted_bam}")
+		shell("samtools index -@ {threads} {output.sorted_bam}")
+
+rule count_reads:
+	input:
+		sorted_bam = "mapping/{sample}/{sample}.sorted.bam"
+	output:
+		table = "mapping/{sample}/{sample}_read_table.tsv"
+	threads: 20
+	run:
+		shell("coverm contig -t {threads} --min-covered-fraction 0 \
+			--min-read-percent-identity 0 --output-format sparse -b {input.sorted_bam} -m count mean covered_fraction length > {output.table}")
